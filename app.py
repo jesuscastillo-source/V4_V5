@@ -214,13 +214,19 @@ LIBREOFFICE_APPIMAGE_ARCHIVO_CONOCIDO = "LibreOffice-fresh-26.8.0.3-en-GB-x86_64
 
 
 def _ruta_soffice_appimage_extraido():
-    """Busca un binario soffice ya extraído de un AppImage previamente descargado.
-    Devuelve la ruta si existe, o None si todavía no se ha instalado."""
+    """Busca un binario soffice.bin ya extraído de un AppImage previamente
+    descargado. Usamos soffice.bin (el motor real) en vez de soffice (el
+    lanzador) a propósito: el lanzador pasa por 'oosplash', que necesita
+    librerías gráficas (libXinerama, para detectar monitores) que no existen
+    en un contenedor de servidor mínimo — aunque estemos en modo headless, el
+    lanzador las pide igual antes de leer ningún parámetro. soffice.bin se
+    salta ese paso por completo. Devuelve la ruta si existe, o None si
+    todavía no se ha instalado."""
     base = os.path.expanduser("~/.libreoffice_appimage/squashfs-root/opt")
     if not os.path.isdir(base):
         return None
     for nombre_carpeta in os.listdir(base):
-        candidato = os.path.join(base, nombre_carpeta, "program", "soffice")
+        candidato = os.path.join(base, nombre_carpeta, "program", "soffice.bin")
         if os.path.isfile(candidato) and os.access(candidato, os.X_OK):
             return candidato
     return None

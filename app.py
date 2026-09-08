@@ -250,25 +250,32 @@ def _descargar_e_instalar_libreoffice_appimage():
     Primero intenta la descarga directa (rápida, sin límite de peticiones). Si
     el archivo conocido ya no existe (rotaron de versión), recién ahí consulta
     la API de GitHub para encontrar el nombre actual — la API sí tiene límite
-    de peticiones por hora, por eso es el plan C, no el camino principal."""
+    de peticiones por hora, por eso es el plan C, no el camino principal.
+
+    Devuelve (ruta_o_None, diagnostico) — diagnostico explica en qué paso
+    falló exactamente, para no quedarnos a ciegas si algo sale mal."""
     import urllib.error
     import urllib.request
 
     destino_base = os.path.expanduser("~/.libreoffice_appimage")
     try:
         os.makedirs(destino_base, exist_ok=True)
+    except Exception as e:
+        return None, f"no se pudo crear la carpeta de instalación ({e})"
 
-        url_directa = (
-            f"https://github.com/{LIBREOFFICE_APPIMAGE_REPO}/releases/download/"
-            f"{LIBREOFFICE_APPIMAGE_TAG}/{LIBREOFFICE_APPIMAGE_ARCHIVO_CONOCIDO}"
-        )
+    url_directa = (
+        f"https://github.com/{LIBREOFFICE_APPIMAGE_REPO}/releases/download/"
+        f"{LIBREOFFICE_APPIMAGE_TAG}/{LIBREOFFICE_APPIMAGE_ARCHIVO_CONOCIDO}"
+    )
+    error_descarga_directa = None
+    try:
+        ok = _descargar_appimage_desde_url(url_directa, destino_base)
+    except Exception as e:
+        ok = False
+        error_descarga_directa = str(e)
+
+    if not ok:
         try:
-            ok = _descargar_appimage_desde_url(url_directa, destino_base)
-        except urllib.error.HTTPError:
-            ok = False
-
-        if not ok:
-            # Plan C: el archivo conocido ya no existe, preguntar a la API cual es el actual
             import json as _json
             url_api = (
                 f"https://api.github.com/repos/{LIBREOFFICE_APPIMAGE_REPO}"
@@ -283,41 +290,56 @@ def _descargar_e_instalar_libreoffice_appimage():
                 None,
             )
             if asset is None:
-                return None
+                return None, (
+                    f"la descarga directa falló ({error_descarga_directa}) y la API "
+                    f"de GitHub no encontró ningún archivo de respaldo válido"
+                )
             ok = _descargar_appimage_desde_url(asset["browser_download_url"], destino_base)
             if not ok:
-                return None
+                return None, f"tanto la descarga directa como la de respaldo (vía API) fallaron"
+        except Exception as e:
+            return None, (
+                f"la descarga directa falló ({error_descarga_directa}) y el plan de "
+                f"respaldo vía API de GitHub también falló ({e})"
+            )
 
-        ruta_appimage = os.path.join(destino_base, "LibreOffice.AppImage")
+    ruta_appimage = os.path.join(destino_base, "LibreOffice.AppImage")
+    try:
         resultado = subprocess.run(
             [ruta_appimage, "--appimage-extract"],
             cwd=destino_base, capture_output=True, timeout=180,
         )
         if resultado.returncode != 0:
-            return None
+            detalle = resultado.stderr.decode("utf-8", errors="ignore")[:300]
+            return None, f"la extracción del AppImage falló (código {resultado.returncode}): {detalle}"
+    except Exception as e:
+        return None, f"la extracción del AppImage lanzó una excepción: {e}"
 
-        return _ruta_soffice_appimage_extraido()
-    except Exception:
-        return None
+    ruta_final = _ruta_soffice_appimage_extraido()
+    if ruta_final is None:
+        return None, "se descargó y extrajo el AppImage, pero no se encontró el binario soffice adentro"
+    return ruta_final, None
 
 
 def _ruta_soffice():
-    """Devuelve la ruta al ejecutable de LibreOffice a usar: primero intenta el
-    del sistema (rápido, ya instalado vía packages.txt); si no está disponible
+    """Devuelve (ruta_o_None, diagnostico). Primero intenta el LibreOffice del
+    sistema (rápido, ya instalado vía packages.txt); si no está disponible
     (ej. apt-get falló por el problema de Debian 11), descarga e instala el
-    AppImage como respaldo automático. Devuelve None si ninguna opción funcionó."""
+    AppImage como respaldo automático."""
     ruta_sistema = shutil.which("soffice")
     if ruta_sistema:
-        return ruta_sistema
+        return ruta_sistema, None
 
     ruta_appimage = _ruta_soffice_appimage_extraido()
     if ruta_appimage:
-        return ruta_appimage
+        return ruta_appimage, None
 
     return _descargar_e_instalar_libreoffice_appimage()
 
 
 def libreoffice_disponible():
+    ruta, _ = _ruta_soffice()
+    return ruta is not None
     return _ruta_soffice() is not None
 
 
@@ -450,14 +472,16 @@ def _contar_imagenes_pdf(pdf_bytes):
         return None
 
 
-def _convertir_lote_soffice(docx_por_nombre: dict, tmpdir_base=None) -> dict:
+def _convertir_lote_soffice(docx_por_nombre: dict, tmpdir_base=None) -> tuple:
     """Convierte un lote {nombre: bytes_docx} a PDF en UNA sola invocación de
-    LibreOffice. Devuelve {nombre: bytes_pdf} (solo los que sí se generaron)."""
+    LibreOffice. Devuelve (resultados, diagnostico):
+    - resultados: {nombre: bytes_pdf} (solo los que sí se generaron)
+    - diagnostico: None si todo bien, o un mensaje explicando qué falló"""
     if not docx_por_nombre:
-        return {}
-    ruta_soffice = _ruta_soffice()
+        return {}, None
+    ruta_soffice, diagnostico_ruta = _ruta_soffice()
     if not ruta_soffice:
-        return {}
+        return {}, f"no se pudo preparar LibreOffice: {diagnostico_ruta}"
     resultados = {}
     with tempfile.TemporaryDirectory() as tmpdir:
         rutas = []
@@ -466,7 +490,7 @@ def _convertir_lote_soffice(docx_por_nombre: dict, tmpdir_base=None) -> dict:
             with open(ruta, "wb") as f:
                 f.write(docx_bytes)
             rutas.append(ruta)
-        subprocess.run(
+        resultado_proceso = subprocess.run(
             [ruta_soffice, "--headless", "--norestore", "--convert-to", "pdf", "--outdir", tmpdir] + rutas,
             capture_output=True, timeout=300,
         )
@@ -475,7 +499,12 @@ def _convertir_lote_soffice(docx_por_nombre: dict, tmpdir_base=None) -> dict:
             if os.path.exists(ruta_pdf):
                 with open(ruta_pdf, "rb") as f:
                     resultados[nombre] = f.read()
-    return resultados
+
+        diagnostico = None
+        if not resultados:
+            stderr = resultado_proceso.stderr.decode("utf-8", errors="ignore")[:400]
+            diagnostico = f"soffice corrió (código {resultado_proceso.returncode}) pero no produjo PDF. stderr: {stderr}"
+    return resultados, diagnostico
 
 
 def convertir_docs_a_pdf_batch(archivos_docx: dict) -> tuple:
@@ -498,8 +527,9 @@ def convertir_docs_a_pdf_batch(archivos_docx: dict) -> tuple:
     el resto de la app (los Word ya generados) no se vea afectado."""
     if not archivos_docx:
         return {}, None
-    if not libreoffice_disponible():
-        return {}, "No se pudo preparar LibreOffice (ni el del sistema ni la descarga de respaldo funcionaron — revisa la conexión del servidor)."
+    ruta_soffice_check, diagnostico_inicial = _ruta_soffice()
+    if not ruta_soffice_check:
+        return {}, f"No se pudo preparar LibreOffice: {diagnostico_inicial}"
 
     try:
         # SIEMPRE se desvinculan los campos de combinación (para el negrita del
@@ -508,9 +538,9 @@ def convertir_docs_a_pdf_batch(archivos_docx: dict) -> tuple:
         # de página, dejando sin negrita a cualquier documento que ya cupiera
         # bien en una página.
         archivos_base = {n: _preparar_docx_para_pdf(b, factor=None) for n, b in archivos_docx.items()}
-        pdfs = _convertir_lote_soffice(archivos_base)
+        pdfs, diagnostico_conversion = _convertir_lote_soffice(archivos_base)
         if not pdfs:
-            return {}, "LibreOffice no generó ningún PDF."
+            return {}, f"LibreOffice no generó ningún PDF. Detalle: {diagnostico_conversion}"
 
         pendientes = {}
         imagenes_base = {}
@@ -524,7 +554,7 @@ def convertir_docs_a_pdf_batch(archivos_docx: dict) -> tuple:
             if not pendientes:
                 break
             docx_ajustados = {n: _preparar_docx_para_pdf(b, factor=factor) for n, b in pendientes.items()}
-            reintentos = _convertir_lote_soffice(docx_ajustados)
+            reintentos, _diag_reintento = _convertir_lote_soffice(docx_ajustados)
             siguen_pendientes = {}
             for nombre, docx_bytes in pendientes.items():
                 pdf_nuevo = reintentos.get(nombre)
